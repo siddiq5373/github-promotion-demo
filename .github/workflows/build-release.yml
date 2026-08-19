@@ -1,0 +1,178 @@
+name: Build Release + DEV
+
+on:
+  push:
+    branches:
+      - 'release/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build immutable package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+
+      - name: Determine release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF_NAME}"
+          VERSION="${BRANCH#release/}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          if [[ "$BRANCH" != release/* || -z "$VERSION" ]]; then
+            echo "Expected branch release/<version>; got: $BRANCH" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build package
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          rm -rf release-output package-root
+          mkdir -p release-output package-root/site
+
+          cp -R app/. package-root/site/
+
+          cat > package-root/build-info.json <<JSON
+          {
+            "version": "${VERSION}",
+            "commit": "${GITHUB_SHA}",
+            "shortCommit": "${SHORT_SHA}",
+            "sourceBranch": "${GITHUB_REF_NAME}",
+            "buildRunId": "${GITHUB_RUN_ID}",
+            "builtAtUtc": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          }
+          JSON
+
+          (
+            cd package-root
+            zip -qr ../release-output/release-package.zip .
+          )
+
+          cp package-root/build-info.json release-output/manifest.json
+          (
+            cd release-output
+            sha256sum release-package.zip > SHA256SUMS.txt
+          )
+
+          echo "Built release ${VERSION} from ${GITHUB_SHA}"
+          ls -lh release-output
+
+      - name: Upload immutable build artifact
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-package
+          path: |
+            release-output/release-package.zip
+            release-output/manifest.json
+            release-output/SHA256SUMS.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Build summary
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.digest }}
+        run: |
+          {
+            echo "## Release build created"
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Build run ID: \`${GITHUB_RUN_ID}\`"
+            echo "- Artifact name: \`release-package\`"
+            echo "- Artifact digest: \`${ARTIFACT_DIGEST}\`"
+            echo
+            echo "Use **${GITHUB_RUN_ID}** as the Build run ID in the **Promote Release** workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy_dev:
+    name: Deploy same package to DEV
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+
+    steps:
+      - name: Download package from this build run
+        uses: actions/download-artifact@v8
+        with:
+          name: release-package
+          path: release-output
+
+      - name: Verify package checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-output
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Simulate DEV deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf deployed-dev
+          mkdir -p deployed-dev
+          unzip -q release-output/release-package.zip -d deployed-dev
+
+          echo "=== DEV deployment contents ==="
+          find deployed-dev -maxdepth 2 -type f -print
+          echo
+          echo "=== Build metadata ==="
+          cat deployed-dev/build-info.json
+
+      - name: Create DEV deployment receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p receipt
+          cp release-output/manifest.json receipt/manifest.json
+          cat > receipt/deployment.txt <<TXT
+          environment=dev
+          source_build_run_id=${GITHUB_RUN_ID}
+          deployment_run_id=${GITHUB_RUN_ID}
+          deployed_at_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          TXT
+
+      - name: Upload DEV receipt
+        uses: actions/upload-artifact@v7
+        with:
+          name: deployment-receipt-dev-${{ github.run_id }}
+          path: receipt/
+          retention-days: 90
+
+      - name: DEV summary
+        shell: bash
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['version'])")
+          COMMIT=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['commit'])")
+          {
+            echo "## DEV deployed"
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- Commit: \`${COMMIT}\`"
+            echo "- Original build run ID: \`${GITHUB_RUN_ID}\`"
+            echo
+            echo "When DEV testing is complete, manually run **Promote Release** with this build run ID."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,177 @@
+name: Promote Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Run ID from Build Release + DEV'
+        required: true
+        type: string
+      target_environment:
+        description: 'Environment to promote the existing build into'
+        required: true
+        type: choice
+        options:
+          - uat
+          - staging
+          - production
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  promote:
+    name: Promote to ${{ inputs.target_environment }}
+    runs-on: ubuntu-latest
+
+    environment:
+      name: ${{ inputs.target_environment }}
+
+    concurrency:
+      group: deploy-${{ inputs.target_environment }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository for production tagging
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download exact artifact from original build run
+        uses: actions/download-artifact@v8
+        with:
+          name: release-package
+          path: release-output
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+
+      - name: Verify package checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-output
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Read immutable build metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['version'])")
+          COMMIT=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['commit'])")
+          SOURCE_BRANCH=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['sourceBranch'])")
+          SOURCE_RUN=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['buildRunId'])")
+
+          if [[ "$SOURCE_RUN" != "${{ inputs.build_run_id }}" ]]; then
+            echo "Manifest buildRunId ($SOURCE_RUN) does not match requested build run ID (${{ inputs.build_run_id }})." >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "source_branch=$SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
+
+          echo "Promoting version=$VERSION commit=$COMMIT source=$SOURCE_BRANCH"
+
+      - name: Simulate deployment to selected environment
+        shell: bash
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+        run: |
+          set -euo pipefail
+
+          DEPLOY_DIR="deployed-${TARGET_ENVIRONMENT}"
+          rm -rf "$DEPLOY_DIR"
+          mkdir -p "$DEPLOY_DIR"
+          unzip -q release-output/release-package.zip -d "$DEPLOY_DIR"
+
+          echo "=== ${TARGET_ENVIRONMENT^^} deployment contents ==="
+          find "$DEPLOY_DIR" -maxdepth 2 -type f -print
+          echo
+          echo "=== Build metadata ==="
+          cat "$DEPLOY_DIR/build-info.json"
+
+          # REAL DEPLOYMENT GOES HERE.
+          # Replace this simulation with one of these later:
+          # - copy to a self-hosted Windows runner deployment directory
+          # - PowerShell Remoting / WinRM
+          # - SFTP / SCP
+          # - rsync / SSH
+          # - your existing deployment script
+
+      - name: Create deployment receipt
+        shell: bash
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p receipt
+          cp release-output/manifest.json receipt/manifest.json
+          cat > receipt/deployment.txt <<TXT
+          environment=${TARGET_ENVIRONMENT}
+          version=${VERSION}
+          commit=${COMMIT}
+          source_build_run_id=${{ inputs.build_run_id }}
+          promotion_workflow_run_id=${GITHUB_RUN_ID}
+          deployed_at_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          TXT
+
+      - name: Upload deployment receipt
+        uses: actions/upload-artifact@v7
+        with:
+          name: deployment-receipt-${{ inputs.target_environment }}-${{ github.run_id }}
+          path: receipt/
+          retention-days: 90
+
+      - name: Create production tag after successful production deployment
+        if: ${{ inputs.target_environment == 'production' }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          TAG="v${VERSION}"
+          git fetch --tags --force
+
+          EXISTING_COMMIT=$(git rev-list -n 1 "$TAG" 2>/dev/null || true)
+
+          if [[ -n "$EXISTING_COMMIT" ]]; then
+            if [[ "$EXISTING_COMMIT" != "$COMMIT" ]]; then
+              echo "Tag $TAG already exists at $EXISTING_COMMIT, expected $COMMIT." >&2
+              exit 1
+            fi
+            echo "Tag $TAG already exists on the correct commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$COMMIT" -m "Production release $TAG"
+          git push origin "$TAG"
+
+      - name: Promotion summary
+        shell: bash
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+        run: |
+          {
+            echo "## Promotion complete"
+            echo
+            echo "- Target: \`${TARGET_ENVIRONMENT}\`"
+            echo "- Version: \`${VERSION}\`"
+            echo "- Commit: \`${COMMIT}\`"
+            echo "- Original build run ID: \`${{ inputs.build_run_id }}\`"
+            echo "- Promotion run ID: \`${GITHUB_RUN_ID}\`"
+            if [[ "$TARGET_ENVIRONMENT" == "production" ]]; then
+              echo "- Production tag: \`v${VERSION}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

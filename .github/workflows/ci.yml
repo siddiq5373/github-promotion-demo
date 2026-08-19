@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Basic validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f app/index.html
+          echo "Sample validation passed."

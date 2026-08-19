@@ -1,0 +1,5 @@
+.DS_Store
+release-output/
+package-root/
+deployed-*/
+receipt/
