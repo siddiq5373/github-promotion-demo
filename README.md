@@ -1,3 +1,7 @@
+# GitHub Promotion Demo v4
+
+> This version uses a delta release package and staging-triggered auto-merge to main.
+
 # GitHub Release Promotion Demo
 
 This repository demonstrates a simple **build once, promote later** workflow:
@@ -114,14 +118,15 @@ The push to `release/1.0.0` triggers:
 It will:
 
 1. Read version `1.0.0` from the branch name.
-2. Package `app/`.
-3. Create `build-info.json` containing the exact commit SHA and build run ID.
-4. Create `release-package.zip`.
-5. Create a SHA-256 checksum.
-6. Upload the files as the `release-package` GitHub Actions artifact.
-7. Download that exact artifact into the DEV deployment job.
-8. Simulate deployment to DEV.
-9. Create a GitHub deployment record for the `dev` environment.
+2. Find the latest reachable production tag (`v*`) and calculate the cumulative Git delta from that tag to the release commit.
+3. Copy only added, modified, type-changed, copied, and renamed-to files under `app/` into the delta package.
+4. Record deleted and renamed-away paths in `deleted-files.txt`.
+5. Create `manifest.json`, `changes.json`, and `release-package.zip`.
+6. Create a SHA-256 checksum.
+7. Upload the files as the `release-package` GitHub Actions artifact.
+8. Download that exact artifact into the DEV deployment job.
+9. Simulate applying the delta to DEV.
+10. Create a GitHub deployment record for the `dev` environment.
 
 Open **Actions > Build Release + DEV > the latest run**.
 
@@ -245,7 +250,7 @@ This demonstrates why the Build run ID matters.
 The sample currently performs this step:
 
 ```text
-unzip release-package.zip into a temporary runner directory
+unzip the delta package and display the files that would be copied/overwritten and deleted
 ```
 
 Replace the `Simulate deployment to selected environment` step with your real deployment method, for example:
@@ -297,3 +302,192 @@ That is the next hardening step after you verify this basic model. A production 
 ## Artifact retention
 
 This sample sets artifact retention to 90 days. If your release approval process can exceed artifact retention, move immutable packages to longer-lived storage such as a package registry or a release-asset repository rather than rebuilding them.
+
+
+## V2: automatic merge to `main` after STAGING
+
+This version adds the missing release-finalization behavior.
+
+### Before you start testing the release
+
+Create the release branch and push it:
+
+```bash
+git switch -c release/1.0.0
+git push -u origin release/1.0.0
+```
+
+Then create **one pull request** and leave it open:
+
+```text
+release/1.0.0 -> main
+```
+
+You can create it in the GitHub UI or with:
+
+```bash
+gh pr create --base main --head release/1.0.0 --title "Release 1.0.0" --body "Release candidate 1.0.0"
+```
+
+Do **not** merge it yet.
+
+### Enable repository auto-merge
+
+In GitHub:
+
+```text
+Repository -> Settings -> General -> Pull Requests -> Allow auto-merge
+```
+
+The STAGING promotion uses `gh pr merge --auto --merge` so GitHub merges the release PR automatically when its merge requirements are satisfied.
+
+### New promotion sequence
+
+```text
+release/1.0.0
+      |
+      +--> BUILD ONCE
+      |       |
+      |      DEV
+      |       |
+      |      UAT
+      |       |
+      |    STAGING
+      |       |
+      |       +--> verify open PR head == tested artifact commit
+      |       |
+      |       +--> enable auto-merge: release/1.0.0 -> main
+      |                         |
+      |                         v
+      |                       main
+      |                         |
+      +-------------------------+
+                                |
+                         production promotion
+                                |
+                    verify tested commit is in main
+                                |
+                                v
+                           PRODUCTION
+                                |
+                                v
+                             v1.0.0
+```
+
+### Important safety checks
+
+The STAGING promotion refuses to enable auto-merge if the release branch has changed since the artifact was built. It compares the PR head SHA with the SHA stored in `manifest.json`.
+
+The PRODUCTION promotion refuses to deploy unless the exact tested release commit is already contained in `main`.
+
+This means production cannot accidentally deploy a release that was never integrated into `main`.
+
+### Why the workflow does not create the PR itself
+
+For this test repository, create the release PR manually once. GitHub normally suppresses new workflow runs for events caused by the workflow's own `GITHUB_TOKEN`. Creating the PR outside the workflow ensures your normal pull-request checks can run as expected.
+
+
+
+## V3: changed-files-only delta release package
+
+The release artifact is now a **delta from the latest production tag** reachable from the release branch. For example:
+
+```text
+v1.0.0 (currently in production)
+   |
+   +-- release/1.1.0
+          |
+          +-- modified: handlers/User.cfc
+          +-- added:    views/report.cfm
+          +-- renamed:  js/old.js -> js/new.js
+          +-- deleted:  views/obsolete.cfm
+```
+
+The resulting artifact contains only the deployment delta:
+
+```text
+release-package.zip
+  files/
+    handlers/User.cfc
+    views/report.cfm
+    js/new.js
+  changed-files.txt
+  deleted-files.txt
+  changes.json
+  manifest.json
+```
+
+`changed-files.txt` contains application-relative paths to copy or overwrite. `deleted-files.txt` contains application-relative paths to remove. A Git rename is represented as **copy the new path + delete the old path**.
+
+Example manifest:
+
+```json
+{
+  "version": "1.1.0",
+  "commit": "abc123...",
+  "sourceBranch": "release/1.1.0",
+  "buildRunId": "123456789",
+  "baseTag": "v1.0.0",
+  "baseCommit": "def456...",
+  "firstRelease": false,
+  "changedFileCount": 3,
+  "deletedFileCount": 2,
+  "changedFiles": [
+    "handlers/User.cfc",
+    "views/report.cfm",
+    "js/new.js"
+  ],
+  "deletedFiles": [
+    "js/old.js",
+    "views/obsolete.cfm"
+  ]
+}
+```
+
+### First release
+
+If the repository has no reachable `v*` production tag yet, the workflow compares the release commit with Git's empty tree. Therefore the first release contains every tracked file under `app/`.
+
+### Important deployment rule for delta packages
+
+A delta must be applied to the version it was built from:
+
+```text
+server currently at v1.0.0
+        +
+v1.0.0 -> v1.1.0 delta
+        =
+valid
+```
+
+Do not apply the same delta to an unknown or older server state without first bringing that server to the expected base version. The real server deployment step should verify `manifest.baseTag` / `manifest.baseCommit` before copying or deleting files.
+
+### Promotion is unchanged
+
+The same immutable delta artifact still moves through the complete release path:
+
+```text
+release/1.1.0
+      |
+      v
+BUILD DELTA ONCE
+      |
+      v
+DEV
+      |
+      v
+UAT
+      |
+      v
+STAGING
+      |
+      +--> auto-merge release PR -> main
+      |
+      v
+PRODUCTION
+      |
+      v
+v1.1.0
+```
+
+No environment rebuilds the delta package.
