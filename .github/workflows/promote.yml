@@ -1,3 +1,4 @@
+# VERSION: v4 - PROMOTION + STAGING AUTO-MERGE WORKFLOW
 name: Promote Release
 
 on:
@@ -19,6 +20,7 @@ on:
 permissions:
   actions: read
   contents: write
+  pull-requests: write
 
 jobs:
   promote:
@@ -33,7 +35,7 @@ jobs:
       cancel-in-progress: false
 
     steps:
-      - name: Checkout repository for production tagging
+      - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -70,13 +72,36 @@ jobs:
             exit 1
           fi
 
+          if [[ "$SOURCE_BRANCH" != release/* ]]; then
+            echo "Expected a release/* source branch; got: $SOURCE_BRANCH" >&2
+            exit 1
+          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
           echo "source_branch=$SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
 
           echo "Promoting version=$VERSION commit=$COMMIT source=$SOURCE_BRANCH"
 
-      - name: Simulate deployment to selected environment
+      - name: Require tested release commit to be merged into main before production
+        if: ${{ inputs.target_environment == 'production' }}
+        shell: bash
+        env:
+          COMMIT: ${{ steps.meta.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git fetch origin main --no-tags
+
+          if ! git merge-base --is-ancestor "$COMMIT" origin/main; then
+            echo "Production blocked." >&2
+            echo "Tested release commit $COMMIT is not contained in main." >&2
+            echo "Promote to STAGING first and allow the release PR to merge into main." >&2
+            exit 1
+          fi
+
+          echo "Verified: tested release commit $COMMIT is contained in main."
+
+      - name: Simulate delta deployment to selected environment
         shell: bash
         env:
           TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
@@ -88,15 +113,28 @@ jobs:
           mkdir -p "$DEPLOY_DIR"
           unzip -q release-output/release-package.zip -d "$DEPLOY_DIR"
 
-          echo "=== ${TARGET_ENVIRONMENT^^} deployment contents ==="
-          find "$DEPLOY_DIR" -maxdepth 2 -type f -print
-          echo
-          echo "=== Build metadata ==="
-          cat "$DEPLOY_DIR/build-info.json"
+          echo "=== Files that would be copied/overwritten in ${TARGET_ENVIRONMENT^^} ==="
+          if [[ -d "$DEPLOY_DIR/files" ]]; then
+            find "$DEPLOY_DIR/files" -type f -print | sort
+          fi
 
-          # REAL DEPLOYMENT GOES HERE.
-          # Replace this simulation with one of these later:
-          # - copy to a self-hosted Windows runner deployment directory
+          echo
+          echo "=== Files that would be deleted in ${TARGET_ENVIRONMENT^^} ==="
+          cat "$DEPLOY_DIR/deleted-files.txt" || true
+
+          echo
+          echo "=== Release manifest ==="
+          cat "$DEPLOY_DIR/manifest.json"
+
+          # REAL DELTA DEPLOYMENT GOES HERE.
+          # Recommended sequence:
+          #   1. Verify target currently matches manifest.baseTag/baseCommit.
+          #   2. Copy $DEPLOY_DIR/files/. into the application root, preserving paths.
+          #   3. Delete each application-relative path listed in deleted-files.txt.
+          #   4. Record manifest.version/commit as the deployed version.
+          #
+          # Transport can be implemented using:
+          # - self-hosted Windows runner + PowerShell
           # - PowerShell Remoting / WinRM
           # - SFTP / SCP
           # - rsync / SSH
@@ -127,6 +165,51 @@ jobs:
           name: deployment-receipt-${{ inputs.target_environment }}-${{ github.run_id }}
           path: receipt/
           retention-days: 90
+
+      - name: Enable automatic release merge after successful STAGING deployment
+        if: ${{ inputs.target_environment == 'staging' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_BRANCH: ${{ steps.meta.outputs.source_branch }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TESTED_COMMIT: ${{ steps.meta.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER=$(gh pr list \
+            --base main \
+            --head "$SOURCE_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "No open release PR found: $SOURCE_BRANCH -> main" >&2
+            echo "Create that PR once, then rerun the STAGING promotion." >&2
+            exit 1
+          fi
+
+          PR_HEAD=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
+          if [[ "$PR_HEAD" != "$TESTED_COMMIT" ]]; then
+            echo "Release PR head changed after the tested build was created." >&2
+            echo "Tested commit: $TESTED_COMMIT" >&2
+            echo "Current PR head: $PR_HEAD" >&2
+            echo "Build and test the new release commit before merging." >&2
+            exit 1
+          fi
+
+          echo "Release PR #$PR_NUMBER matches tested commit $TESTED_COMMIT."
+          echo "Enabling auto-merge using a merge commit..."
+
+          gh pr merge "$PR_NUMBER" \
+            --auto \
+            --merge \
+            --match-head-commit "$TESTED_COMMIT"
+
+          echo "Auto-merge enabled for PR #$PR_NUMBER."
+          echo "If all merge requirements are already satisfied, GitHub may merge it immediately."
+          echo "Otherwise it will merge when the remaining requirements pass."
 
       - name: Create production tag after successful production deployment
         if: ${{ inputs.target_environment == 'production' }}
@@ -171,7 +254,11 @@ jobs:
             echo "- Commit: \`${COMMIT}\`"
             echo "- Original build run ID: \`${{ inputs.build_run_id }}\`"
             echo "- Promotion run ID: \`${GITHUB_RUN_ID}\`"
+            if [[ "$TARGET_ENVIRONMENT" == "staging" ]]; then
+              echo "- Release PR: auto-merge enabled after successful STAGING deployment"
+            fi
             if [[ "$TARGET_ENVIRONMENT" == "production" ]]; then
+              echo "- Main containment check: passed"
               echo "- Production tag: \`v${VERSION}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
