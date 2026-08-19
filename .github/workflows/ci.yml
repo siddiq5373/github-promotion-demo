@@ -10,12 +10,48 @@ permissions:
 
 jobs:
   validate:
+    name: Validate release
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v7
-      - name: Basic validation
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Show PR information
+        shell: bash
+        run: |
+          echo "Source: ${{ github.head_ref }}"
+          echo "Target: ${{ github.base_ref }}"
+          echo "Commit: ${{ github.event.pull_request.head.sha }}"
+
+      - name: Validate application
         shell: bash
         run: |
           set -euo pipefail
-          test -f app/index.html
-          echo "Sample validation passed."
+
+          if [ ! -d "app" ]; then
+            echo "::error::app directory does not exist."
+            exit 1
+          fi
+
+          echo "Application directory validation passed."
+
+      - name: List files changed by PR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git diff \
+            --name-status \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}"
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Replace this with your real tests.
+          echo "Tests passed."
