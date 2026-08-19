@@ -1,0 +1,22 @@
+UPDATED WORKFLOW FILES
+======================
+
+1. .github/workflows/build-release.yml
+   - Builds delta package only.
+   - Compares latest reachable production v* tag to release branch HEAD.
+   - Packages added/modified/renamed files under app/.
+   - Writes deleted/renamed-away paths to deleted-files.txt.
+   - Creates manifest.json and SHA256SUMS.txt.
+   - Uploads one immutable release-package artifact.
+   - DEV deploy uses the exact uploaded artifact.
+
+2. .github/workflows/promote.yml
+   - Downloads exact release-package from original build_run_id.
+   - Promotes same package to UAT/STAGING/PRODUCTION.
+   - After successful STAGING deployment, enables auto-merge for release/* -> main PR.
+   - Blocks PRODUCTION until tested commit is contained in main.
+   - Creates production vX.Y.Z tag after production deployment.
+
+UNCHANGED
+=========
+.github/workflows/ci.yml

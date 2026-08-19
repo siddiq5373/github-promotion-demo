@@ -1,3 +1,4 @@
+# VERSION: v4 - DELTA PACKAGE WORKFLOW (changed/added/renamed/deleted files only)
 name: Build Release + DEV
 
 on:
@@ -10,12 +11,14 @@ permissions:
 
 jobs:
   build:
-    name: Build immutable package
+    name: Build immutable delta package
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout release commit
+      - name: Checkout release commit with history and tags
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Determine release metadata
         id: meta
@@ -32,48 +35,207 @@ jobs:
             exit 1
           fi
 
+          # Use the newest production tag that is an ancestor of this release.
+          # This makes the package a cumulative delta from what is actually in production.
+          BASE_TAG=$(git tag --merged "$GITHUB_SHA" --list 'v*' --sort=-version:refname | head -n 1 || true)
+
+          if [[ -n "$BASE_TAG" ]]; then
+            BASE_REF="$BASE_TAG"
+            BASE_COMMIT=$(git rev-parse "$BASE_TAG^{commit}")
+            FIRST_RELEASE=false
+            echo "Delta base: $BASE_TAG ($BASE_COMMIT)"
+          else
+            # No production tag yet: compare against Git's empty tree so the first
+            # package contains every tracked deployment file under app/.
+            BASE_REF=$(git hash-object -t tree /dev/null)
+            BASE_COMMIT="$BASE_REF"
+            FIRST_RELEASE=true
+            echo "No production v* tag found. Building initial full deployment delta."
+          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "base_tag=$BASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+          echo "base_commit=$BASE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "first_release=$FIRST_RELEASE" >> "$GITHUB_OUTPUT"
 
-      - name: Build package
+      - name: Build changed-files-only release package
+        id: package
         shell: bash
         env:
           VERSION: ${{ steps.meta.outputs.version }}
           SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+          BASE_TAG: ${{ steps.meta.outputs.base_tag }}
+          BASE_REF: ${{ steps.meta.outputs.base_ref }}
+          BASE_COMMIT: ${{ steps.meta.outputs.base_commit }}
+          FIRST_RELEASE: ${{ steps.meta.outputs.first_release }}
         run: |
           set -euo pipefail
 
           rm -rf release-output package-root
-          mkdir -p release-output package-root/site
+          mkdir -p release-output package-root/files
 
-          cp -R app/. package-root/site/
+          # Build the delta safely with Python so spaces and unusual characters in
+          # Git filenames do not break parsing. Only files under app/ are deployable.
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
 
-          cat > package-root/build-info.json <<JSON
-          {
-            "version": "${VERSION}",
-            "commit": "${GITHUB_SHA}",
-            "shortCommit": "${SHORT_SHA}",
-            "sourceBranch": "${GITHUB_REF_NAME}",
-            "buildRunId": "${GITHUB_RUN_ID}",
-            "builtAtUtc": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          base_ref = os.environ["BASE_REF"]
+          target = os.environ["GITHUB_SHA"]
+          package_root = pathlib.Path("package-root")
+          files_root = package_root / "files"
+
+          raw = subprocess.check_output([
+              "git", "diff", "--name-status", "-z", "-M", "-C",
+              base_ref, target, "--", "app/"
+          ])
+          fields = raw.decode("utf-8", "surrogateescape").split("\0")
+          if fields and fields[-1] == "":
+              fields.pop()
+
+          changed = []
+          deleted = []
+          detail = []
+          i = 0
+
+          def deployment_path(repo_path: str) -> pathlib.PurePosixPath:
+              prefix = "app/"
+              if not repo_path.startswith(prefix):
+                  raise SystemExit(f"Refusing path outside app/: {repo_path!r}")
+              rel = pathlib.PurePosixPath(repo_path[len(prefix):])
+              if not rel.parts or rel.is_absolute() or any(p in ("", ".", "..") for p in rel.parts):
+                  raise SystemExit(f"Unsafe deployment path: {repo_path!r}")
+              return rel
+
+          while i < len(fields):
+              status = fields[i]
+              i += 1
+              code = status[0]
+
+              if code in ("R", "C"):
+                  if i + 1 >= len(fields):
+                      raise SystemExit("Unexpected truncated rename/copy record from git diff")
+                  old_repo = fields[i]
+                  new_repo = fields[i + 1]
+                  i += 2
+                  old_rel = deployment_path(old_repo)
+                  new_rel = deployment_path(new_repo)
+
+                  # A rename deploys the new path and removes the old path.
+                  # A copy deploys the new path but leaves the old path in place.
+                  changed.append(new_rel.as_posix())
+                  if code == "R" and old_rel != new_rel:
+                      deleted.append(old_rel.as_posix())
+
+                  detail.append({
+                      "status": status,
+                      "oldPath": old_rel.as_posix(),
+                      "path": new_rel.as_posix()
+                  })
+                  source_rel = new_rel
+
+              else:
+                  if i >= len(fields):
+                      raise SystemExit("Unexpected truncated record from git diff")
+                  repo_path = fields[i]
+                  i += 1
+                  rel = deployment_path(repo_path)
+
+                  if code == "D":
+                      deleted.append(rel.as_posix())
+                      detail.append({"status": status, "path": rel.as_posix()})
+                      continue
+
+                  if code not in ("A", "M", "T"):
+                      raise SystemExit(f"Unsupported git diff status {status!r} for {repo_path!r}")
+
+                  changed.append(rel.as_posix())
+                  detail.append({"status": status, "path": rel.as_posix()})
+                  source_rel = rel
+
+              source = pathlib.Path("app") / pathlib.Path(*source_rel.parts)
+              if not source.is_file():
+                  raise SystemExit(f"Expected deployment file does not exist: {source}")
+
+              destination = files_root / pathlib.Path(*source_rel.parts)
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source, destination)
+
+          # Preserve order while removing duplicates (possible with unusual rename chains).
+          changed = list(dict.fromkeys(changed))
+          deleted = list(dict.fromkeys(deleted))
+
+          (package_root / "changed-files.txt").write_text(
+              "".join(f"{p}\n" for p in changed), encoding="utf-8"
+          )
+          (package_root / "deleted-files.txt").write_text(
+              "".join(f"{p}\n" for p in deleted), encoding="utf-8"
+          )
+          (package_root / "changes.json").write_text(
+              json.dumps(detail, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+          )
+
+          manifest = {
+              "version": os.environ["VERSION"],
+              "commit": target,
+              "shortCommit": os.environ["SHORT_SHA"],
+              "sourceBranch": os.environ["GITHUB_REF_NAME"],
+              "buildRunId": os.environ["GITHUB_RUN_ID"],
+              "baseTag": os.environ["BASE_TAG"] or None,
+              "baseCommit": os.environ["BASE_COMMIT"],
+              "firstRelease": os.environ["FIRST_RELEASE"].lower() == "true",
+              "changedFileCount": len(changed),
+              "deletedFileCount": len(deleted),
+              "changedFiles": changed,
+              "deletedFiles": deleted,
           }
-          JSON
+          (package_root / "manifest.json").write_text(
+              json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+          )
+
+          print(f"Changed/added/renamed files: {len(changed)}")
+          for path in changed:
+              print(f"  + {path}")
+          print(f"Deleted/renamed-away files: {len(deleted)}")
+          for path in deleted:
+              print(f"  - {path}")
+          PY
 
           (
             cd package-root
             zip -qr ../release-output/release-package.zip .
           )
 
-          cp package-root/build-info.json release-output/manifest.json
+          cp package-root/manifest.json release-output/manifest.json
+          cp package-root/changed-files.txt release-output/changed-files.txt
+          cp package-root/deleted-files.txt release-output/deleted-files.txt
+          cp package-root/changes.json release-output/changes.json
+
           (
             cd release-output
             sha256sum release-package.zip > SHA256SUMS.txt
           )
 
-          echo "Built release ${VERSION} from ${GITHUB_SHA}"
-          ls -lh release-output
+          CHANGED_COUNT=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['changedFileCount'])")
+          DELETED_COUNT=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['deletedFileCount'])")
 
-      - name: Upload immutable build artifact
+          echo "changed_count=$CHANGED_COUNT" >> "$GITHUB_OUTPUT"
+          echo "deleted_count=$DELETED_COUNT" >> "$GITHUB_OUTPUT"
+
+          echo "Built release ${VERSION} delta from ${BASE_TAG:-<initial>} to ${GITHUB_SHA}"
+          echo "=== Changed files ==="
+          cat release-output/changed-files.txt || true
+          echo "=== Deleted files ==="
+          cat release-output/deleted-files.txt || true
+          echo "=== Package ==="
+          unzip -l release-output/release-package.zip
+
+      - name: Upload immutable delta artifact
         id: upload
         uses: actions/upload-artifact@v7
         with:
@@ -81,6 +243,9 @@ jobs:
           path: |
             release-output/release-package.zip
             release-output/manifest.json
+            release-output/changed-files.txt
+            release-output/deleted-files.txt
+            release-output/changes.json
             release-output/SHA256SUMS.txt
           retention-days: 90
           if-no-files-found: error
@@ -89,13 +254,19 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          BASE_TAG: ${{ steps.meta.outputs.base_tag }}
+          CHANGED_COUNT: ${{ steps.package.outputs.changed_count }}
+          DELETED_COUNT: ${{ steps.package.outputs.deleted_count }}
           ARTIFACT_DIGEST: ${{ steps.upload.outputs.digest }}
         run: |
           {
-            echo "## Release build created"
+            echo "## Release delta created"
             echo
             echo "- Version: \`${VERSION}\`"
-            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Delta base: \`${BASE_TAG:-initial empty tree}\`"
+            echo "- Target commit: \`${GITHUB_SHA}\`"
+            echo "- Changed/added/renamed files: \`${CHANGED_COUNT}\`"
+            echo "- Deleted/renamed-away files: \`${DELETED_COUNT}\`"
             echo "- Build run ID: \`${GITHUB_RUN_ID}\`"
             echo "- Artifact name: \`release-package\`"
             echo "- Artifact digest: \`${ARTIFACT_DIGEST}\`"
@@ -104,7 +275,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy_dev:
-    name: Deploy same package to DEV
+    name: Deploy same delta package to DEV
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -127,7 +298,7 @@ jobs:
           cd release-output
           sha256sum -c SHA256SUMS.txt
 
-      - name: Simulate DEV deployment
+      - name: Simulate DEV delta deployment
         shell: bash
         run: |
           set -euo pipefail
@@ -136,11 +307,24 @@ jobs:
           mkdir -p deployed-dev
           unzip -q release-output/release-package.zip -d deployed-dev
 
-          echo "=== DEV deployment contents ==="
-          find deployed-dev -maxdepth 2 -type f -print
+          echo "=== Files that would be copied/overwritten in DEV ==="
+          if [[ -d deployed-dev/files ]]; then
+            find deployed-dev/files -type f -print | sort
+          fi
+
           echo
-          echo "=== Build metadata ==="
-          cat deployed-dev/build-info.json
+          echo "=== Files that would be deleted in DEV ==="
+          cat deployed-dev/deleted-files.txt || true
+
+          echo
+          echo "=== Release manifest ==="
+          cat deployed-dev/manifest.json
+
+          # REAL DELTA DEPLOYMENT LATER:
+          #   1. Verify the target environment is currently on manifest.baseTag.
+          #   2. Copy deployed-dev/files/. into the application root, preserving paths.
+          #   3. Delete each application-relative path in deleted-files.txt.
+          #   4. Record manifest.version / manifest.commit as the deployed version.
 
       - name: Create DEV deployment receipt
         shell: bash
@@ -167,11 +351,17 @@ jobs:
         run: |
           VERSION=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['version'])")
           COMMIT=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['commit'])")
+          BASE_TAG=$(python3 -c "import json; x=json.load(open('release-output/manifest.json')); print(x['baseTag'] or '<initial>')")
+          CHANGED=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['changedFileCount'])")
+          DELETED=$(python3 -c "import json; print(json.load(open('release-output/manifest.json'))['deletedFileCount'])")
           {
-            echo "## DEV deployed"
+            echo "## DEV delta deployed"
             echo
             echo "- Version: \`${VERSION}\`"
+            echo "- Base: \`${BASE_TAG}\`"
             echo "- Commit: \`${COMMIT}\`"
+            echo "- Changed files: \`${CHANGED}\`"
+            echo "- Deleted files: \`${DELETED}\`"
             echo "- Original build run ID: \`${GITHUB_RUN_ID}\`"
             echo
             echo "When DEV testing is complete, manually run **Promote Release** with this build run ID."
